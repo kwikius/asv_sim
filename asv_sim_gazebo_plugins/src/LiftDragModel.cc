@@ -79,6 +79,9 @@ class LiftDragModelPrivate
 
   /// \brief Slope of skin friction coefficient.
   public: double cf = 0.0;
+
+  /// \brief radius around stall region giving a softer stall
+  public: double rStall = 0.0;
 };
 
 /////////////////////////////////////////////////
@@ -117,11 +120,22 @@ LiftDragModel* LiftDragModel::Create(
   asv::LoadParam(_sdf, "cla_stall", data->claStall, data->claStall);
   asv::LoadParam(_sdf, "cda", data->cda, data->cda);
   asv::LoadParam(_sdf, "cf", data->cf, data->cf);
+  asv::LoadParam(_sdf, "r_stall", data->rStall, data->rStall);
 
   // Only support radially symmetric lift-drag coefficients at present
   if (!data->radialSymmetry)
   {
     gzerr << "LiftDragModel only supports radially symmetric foils\n";
+    return nullptr;
+  }
+
+  if ( data->rStall >= data->alphaStall){
+    gzerr << "r_stall must be less than alpha_stall\n";
+    return nullptr;
+  }
+  // avoid div epsilon on stall radius
+  if ( (data->rStall > 0.0) && (data->rStall < 0.01) ){
+    gzerr << "non zero r_stall must be greater equal 0.01\n";
     return nullptr;
   }
 
@@ -254,31 +268,109 @@ double LiftDragModel::LiftCoefficient(double _alpha) const
   double cla        = this->data->cla;
   double alphaStall = this->data->alphaStall;
   double claStall   = this->data->claStall;
+  double rStall     = this->data->rStall;
 
-  auto f1 = [=](auto _x)
-  {
-    return cla * (_x - alpha0);
-  };
+  if ( rStall > 0.0){
 
-  auto f2 = [=](auto _x)
-  {
-    if (_x < alphaStall)
-      return f1(_x);
-    else
-      return claStall * (_x - alphaStall) + f1(alphaStall);
-  };
+// The angle of the straight slope  slope in the lift region
+   double const straightLiftSlopeAngle = atan2(cla,1.0);
 
-  double cl = 0.0;
-  if (_alpha < GZ_PI/2.0)
-  {
-    cl = f2(_alpha);
+   // The angle of the straight slope in the stall region
+   double const straightStallSlopeAngle = atan2(claStall,1.0);
+
+   // angle between lift and stall straight slope lines
+   double const betweenLiftStallSlopesAngle
+      = straightStallSlopeAngle + (GZ_PI - straightLiftSlopeAngle);
+   // distance from the stall point at corner between lift and stall lines
+   double const StallPointToR_StallCenter = rStall / sin(betweenLiftStallSlopesAngle/2.0);
+
+   // Angle of center of stall circle with StallPoint
+   double const StallCircleAngle = betweenLiftStallSlopesAngle/2.0 + straightLiftSlopeAngle;
+
+   /// return cl on straight part of lift curve as a function of angle of attack
+   /// @param[in] alpha angle of attack of the foil in radians
+   /// @return cl at alpha
+   auto clStraightLift = [=] (double alpha){
+       return cla * (alpha - alpha0);
+   };
+   //using vect = quan::two_d::vect<double>;
+   using vect = gz::math::Vector2d;
+   // center of stall r circle rel to stall point
+   auto const rawCircleCenter = vect{cos(StallCircleAngle), sin(StallCircleAngle)} * -StallPointToR_StallCenter;
+
+// point where stall would occur if stall radius was 0
+   auto const rawStallPoint = vect{alphaStall,clStraightLift(alphaStall)};
+
+// The center of the stall radius circle on the graph
+   auto const stall_R_CircleCenter = rawCircleCenter + rawStallPoint;
+
+   // xaxis maximum angle to pick off cl (y) on straight lift line
+   double const maxStraightAlpha = stall_R_CircleCenter.X() - rStall * sin(straightLiftSlopeAngle);
+
+   // xaxis minimum angle  to pick off cl (y) on straight stall line
+   double const minStraightStallAlpha = stall_R_CircleCenter.X()- rStall * sin(straightStallSlopeAngle);
+
+   // return cl on straight part of stall curve
+   auto clStraightStall = [=](double alpha){
+      return  claStall * (alpha - alphaStall) + clStraightLift(alphaStall);
+   };
+
+   // cl on stall_circle curve around stall region
+   auto clStall_R =[=] (double alpha) {
+      return stall_R_CircleCenter.Y() + sin(acos((stall_R_CircleCenter.X() - alpha)/rStall)) * rStall;
+   };
+
+   // return cl for alpha
+   auto fn_cl = [=]( double alpha){
+
+      double const r = ( alpha <= maxStraightAlpha)
+      ? clStraightLift(alpha)
+      : ( alpha >= minStraightStallAlpha )
+         ? clStraightStall(alpha)
+         : clStall_R(alpha);
+
+      return std::max(r,0.0);
+    };
+
+     double cl = 0.0;
+     if (_alpha < GZ_PI/2.0)
+     {
+       cl = fn_cl(_alpha);
+     }
+     else
+     {
+       cl = -fn_cl(GZ_PI - _alpha);
+     }
+
+     return cl;
+
+  }else{
+
+     auto f1 = [=](auto _x)
+     {
+       return cla * (_x - alpha0);
+     };
+
+     auto f2 = [=](auto _x)
+     {
+       if (_x < alphaStall)
+         return f1(_x);
+       else
+         return claStall * (_x - alphaStall) + f1(alphaStall);
+     };
+
+     double cl = 0.0;
+     if (_alpha < GZ_PI/2.0)
+     {
+       cl = f2(_alpha);
+     }
+     else
+     {
+       cl = -f2(GZ_PI - _alpha);
+     }
+
+     return cl;
   }
-  else
-  {
-    cl = -f2(GZ_PI - _alpha);
-  }
-
-  return cl;
 }
 
 /////////////////////////////////////////////////
